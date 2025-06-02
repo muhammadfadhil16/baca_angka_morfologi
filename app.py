@@ -4,148 +4,147 @@ import numpy as np
 import mysql.connector
 
 TEMPLATE_DIR = 'templates'
-IMAGE_PATH = 'B.jpg'
+IMAGE_PATH = '3.jpg'
 
-def save_features_to_db(digit, features, x, y):
+
+def extract_hu_moments(contour):
+    """
+    Ekstrak 7 Hu Moments dari sebuah kontur.
+    """
+    moments = cv2.moments(contour)
+    hu = cv2.HuMoments(moments).flatten()
+    hu = -np.sign(hu) * np.log10(np.abs(hu) + 1e-10)
+    return hu
+
+def save_features_to_db(digit, features):
+    """
+    Simpan fitur Hu Moments ke database.
+    """
     conn = mysql.connector.connect(
         host='localhost',
         user='root',
-        password='',
+        password='aktif2025',
         database='digit_morphology'
     )
     cursor = conn.cursor()
-    query = "INSERT INTO features (digit, aspect_ratio, extent, solidity) VALUES (%s, %s, %s, %s)"
+    query = "INSERT INTO features (digit, hu1, hu2, hu3, hu4, hu5, hu6, hu7) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
     cursor.execute(query, (digit, *features))
     conn.commit()
     cursor.close()
     conn.close()
 
-def extract_morphology_features(contour):
-    area = cv2.contourArea(contour)
-    x, y, w, h = cv2.boundingRect(contour)
-    aspect_ratio = float(w) / h
-    extent = float(area) / (w * h)
-    hull = cv2.convexHull(contour)
-    hull_area = cv2.contourArea(hull)
-    solidity = float(area) / hull_area if hull_area > 0 else 0
-    return aspect_ratio, extent, solidity
-
-def load_digit_templates(template_dir):
+def load_features_from_db():
     """
-    Memuat banyak template per digit dan menyimpan fitur ke database.
+    Ambil semua fitur digit dari database.
     """
-    templates = {}  # digit: list of (template_image, features)
-    for filename in os.listdir(template_dir):
-        if filename.endswith(('.jpg', '.png')):
-            try:
-                digit = int(filename.split('_')[0])
-            except ValueError:
-                continue  # Lewati jika nama file tidak sesuai format
+    try:
+        conn = mysql.connector.connect(
+            host='localhost',
+            user='root',
+            password='aktif2025',
+            database='digit_morphology'
+        )
+        cursor = conn.cursor()
+        cursor.execute("SELECT digit, hu1, hu2, hu3, hu4, hu5, hu6, hu7 FROM features")
+        data = cursor.fetchall()
+        cursor.close()
+        conn.close()
+    except mysql.connector.Error as err:
+        print(f"Database error: {err}")
+        return []
+    features_db = []
+    for row in data:
+        digit = row[0]
+        hu = np.array(row[1:], dtype=np.float64)
+        features_db.append((digit, hu))
+    return features_db
 
-            path = os.path.join(template_dir, filename)
-            template_img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            _, thresh = cv2.threshold(template_img, 127, 255, cv2.THRESH_BINARY_INV)
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                largest_contour = max(contours, key=cv2.contourArea)
-                features = extract_morphology_features(largest_contour)
-                save_features_to_db(digit, features)
-                templates.setdefault(digit, []).append((template_img, features))
-    return templates
-
-def recognize_digit_with_template(cropped_digit, templates):
+def recognize_digit_by_features(features, features_db, k=3):
     """
-    Kenali digit menggunakan template matching dan fitur morfologi.
+    KNN sederhana berdasarkan Hu Moments.
     """
-    # Preprocessing digit yang dicrop
-    _, thresh = cv2.threshold(cropped_digit, 127, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    # Ambil kontur terbesar dari digit yang dicrop
-    largest_contour = max(contours, key=cv2.contourArea)
-    cropped_features = extract_morphology_features(largest_contour)
-
-    best_match = None
-    best_score = float('inf')
-
-    for digit, template_list in templates.items():
-        for template_img, template_features in template_list:
-            # Resize template agar sesuai dengan ukuran digit yang dicrop
-            resized_template = cv2.resize(template_img, (cropped_digit.shape[1], cropped_digit.shape[0]))
-
-            # Template matching
-            result = cv2.matchTemplate(cropped_digit, resized_template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, _ = cv2.minMaxLoc(result)
-
-            # Hitung jarak fitur morfologi
-            template_features = np.array(template_features)
-            morphology_distance = np.linalg.norm(cropped_features - template_features)
-
-            # Kombinasikan skor template matching dan jarak fitur morfologi
-            morphology_weight = 1.0
-            template_weight = 2.0
-            combined_score = template_weight * -max_val + morphology_weight * morphology_distance
-
-            # Debugging: Cetak skor template matching
-            print(f"Template Digit: {digit}, Max Val: {max_val}, Morphology Distance: {morphology_distance}, Combined Score: {combined_score}")
-
-            if combined_score < best_score:
-                best_score = combined_score
-                best_match = digit
-
-            # Debugging: Tampilkan hasil template matching
-            cv2.imshow("Cropped Digit", cropped_digit)
-            cv2.imshow("Resized Template", resized_template)
-            cv2.waitKey(0)
-
-    cv2.destroyAllWindows()
-    return best_match
+    distances = []
+    for digit, ref_features in features_db:
+        distance = np.linalg.norm(features - ref_features)
+        distances.append((distance, digit))
+    distances.sort()
+    nearest = [d for _, d in distances[:k]]
+    # Voting
+    counts = np.bincount(nearest)
+    return np.argmax(counts)
 
 def read_pdam_meter(image_path):
+    """
+    Membaca angka dari gambar meteran menggunakan fitur Hu Moments dan KNN.
+    """
     print("[*] Membaca gambar...")
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        print(f"Error: Gambar '{image_path}' tidak ditemukan atau format tidak didukung.")
+        return ""
     thresh = cv2.adaptiveThreshold(
         img, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV, 11, 2
     )
 
-    print("[*] Memuat template digit...")
-    templates = load_digit_templates(TEMPLATE_DIR)
+    print("[*] Memuat fitur dari database...")
+    features_db = load_features_from_db()
+    if not features_db:
+        print("Database fitur kosong! Jalankan train_from_templates() dulu.")
+        return ""
 
     print("[*] Menemukan kontur digit...")
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Urutkan kontur berdasarkan posisi horizontal (x)
     sorted_contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[0])
 
     meter_reading = ""
     for i, contour in enumerate(sorted_contours):
         x, y, w, h = cv2.boundingRect(contour)
-        if w > 10 and h > 10 and w < 100 and h < 200:  # Filter kontur kecil dan besar
+        if w > 10 and h > 10 and w < 100 and h < 200:
             cropped_digit = thresh[y:y+h, x:x+w]
+            hu_features = extract_hu_moments(contour)
+            predicted_digit = recognize_digit_by_features(hu_features, features_db, k=3)
 
-            # Visualisasi kontur
-            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            if predicted_digit is not None:
+                meter_reading += str(predicted_digit)
 
-            # Kenali digit menggunakan template matching
-            recognized_digit = recognize_digit_with_template(cropped_digit, templates)
-            if recognized_digit is not None:
-                meter_reading += str(recognized_digit)
+            print(f"Digit ke-{i+1}: {predicted_digit}, Hu Moments: {hu_features}")
 
-            # Debugging: Cetak koordinat dan hasil pengenalan
-            print(f"Digit ke-{i+1}: x={x}, y={y}, w={w}, h={h}")
-            print(f"  Recognized Digit: {recognized_digit}")
-
-            # Tampilkan hasil cropping
-            cv2.imshow(f"Digit ke-{i+1}: {recognized_digit}", cropped_digit)
+            cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.imshow(f"Digit {predicted_digit}", cropped_digit)
             cv2.waitKey(0)
 
     cv2.destroyAllWindows()
     print(f"\n[*] Hasil Pembacaan Meter: {meter_reading}")
     return meter_reading
 
+def train_from_templates(template_dir):
+    """
+    Ekstrak fitur dari semua file di folder template dan simpan ke database.
+    """
+    for filename in os.listdir(template_dir):
+        if filename.endswith(('.jpg', '.png')):
+            try:
+                digit = int(filename.split('_')[0])
+            except ValueError:
+                print(f"File {filename} dilewati (format nama tidak sesuai).")
+                continue
+            path = os.path.join(template_dir, filename)
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                print(f"File {filename} gagal dibaca.")
+                continue
+            _, thresh = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest = max(contours, key=cv2.contourArea)
+                hu_features = extract_hu_moments(largest)
+                save_features_to_db(digit, hu_features)
+                print(f"✔ Saved: {filename} => {hu_features}")
+            else:
+                print(f"Tidak ditemukan kontur pada {filename}.")
+
 if __name__ == "__main__":
+    # train_from_templates(TEMPLATE_DIR)  # Aktifkan dulu untuk isi database fitur Hu Moments
     read_pdam_meter(IMAGE_PATH)
